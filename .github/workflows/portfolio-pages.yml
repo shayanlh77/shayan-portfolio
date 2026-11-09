@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v6
       - name: Copy the exact public portfolio release
@@ -65,6 +65,63 @@ jobs:
           await Promise.all(Array.from({ length: 6 }, download));
           await writeFile(join(root, '.nojekyll'), '');
           console.log('All 155 release files passed checksum verification.');
+          NODE
+      - name: Publish and verify original videos in GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='portfolio-videos-08143875'
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title 'Portfolio preview videos' --notes 'Original video files for the portfolio access preview.'
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/portfolio-release.json"
+          mapfile -t missing < <(node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          const { assets } = JSON.parse(await readFile(process.env.RUNNER_TEMP + '/portfolio-release.json', 'utf8'));
+          const uploaded = new Set(assets.filter(asset => asset.state === 'uploaded').map(asset => asset.name));
+          const manifest = (await readFile('release.sha256', 'utf8')).trim().split('\n');
+          for (const entry of manifest) {
+            const match = /^\w{64}  (assets\/portfolio\/([a-z0-9-]+\.mp4))$/.exec(entry);
+            if (match && !uploaded.has(match[2])) console.log('_site/' + match[1]);
+          }
+          NODE
+          )
+          if (( ${#missing[@]} )); then
+            gh release upload "$tag" "${missing[@]}"
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$RUNNER_TEMP/portfolio-release.json"
+          node --input-type=module <<'NODE'
+          import { readdir, readFile, unlink, writeFile } from 'node:fs/promises';
+          const { assets } = JSON.parse(await readFile(process.env.RUNNER_TEMP + '/portfolio-release.json', 'utf8'));
+          const uploaded = new Map(assets.map(asset => [asset.name, asset]));
+          const manifest = (await readFile('release.sha256', 'utf8')).trim().split('\n');
+          const links = new Map();
+          for (const entry of manifest) {
+            const match = /^([a-f0-9]{64})  (assets\/portfolio\/([a-z0-9-]+\.mp4))$/.exec(entry);
+            if (!match) continue;
+            const [, hash, path, name] = match;
+            const asset = uploaded.get(name);
+            if (asset?.state !== 'uploaded' || asset.digest !== 'sha256:' + hash) {
+              throw new Error('Release video checksum mismatch: ' + name);
+            }
+            links.set(path, asset.browser_download_url);
+          }
+          if (links.size !== 45) throw new Error('Expected 45 original release videos.');
+          for (const name of await readdir('_site')) {
+            if (!name.endsWith('.html')) continue;
+            const file = '_site/' + name;
+            const original = await readFile(file, 'utf8');
+            const updated = original.replace(/assets\/portfolio\/[a-z0-9-]+\.mp4/g, path => {
+              if (!links.has(path)) throw new Error('Unknown video reference: ' + path);
+              return links.get(path);
+            });
+            if (updated !== original) await writeFile(file, updated);
+          }
+          await Promise.all([...links.keys()].map(path => unlink('_site/' + path)));
+          console.log('All 45 original video checksums verified in GitHub Releases.');
           NODE
       - uses: actions/upload-pages-artifact@v4
         with:
